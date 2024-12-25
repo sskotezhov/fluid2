@@ -5,17 +5,16 @@
 #include <ranges>
 #include <random>
 #include <algorithm>
-#include <thread>
-#include <condition_variable>
-#include <queue>
-#include <functional>
-#include <future>
-
+#include <omp.h>
+#define THREADS_NUM 16
+#ifndef THREADS_NUM
+#error "THREADS_NUM is not defined"
+#endif
 using namespace std;
 
 constexpr size_t N = 36, M = 84;
 // constexpr size_t N = 14, M = 5;
-constexpr size_t T = 1'000;
+constexpr size_t T = 3'00;
 constexpr std::array<pair<int, int>, 4> deltas{{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}};
 
 // char field[N][M + 1] = {
@@ -73,84 +72,6 @@ char field[N][M + 1] = {
     "#                                                                                  #",
     "####################################################################################",
 };
-class ThreadPool {
-private:
-    std::vector<std::thread> workers;
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<std::function<void()>> queue;
-    void worker();
-    bool stop;
-
-public:
-    ThreadPool(std::size_t nr_threads = std::thread::hardware_concurrency());
-    ~ThreadPool();
-
-    template<typename F, typename... Args>
-    auto enqueue(F&& f, Args&&... args) -> std::future<decltype(f(args...))>;
-
-    ThreadPool(ThreadPool&) = delete;
-    ThreadPool(const ThreadPool&) = delete;
-    ThreadPool& operator=(ThreadPool&&) = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
-};
-ThreadPool::ThreadPool(std::size_t nr_workers) {
-    stop = false;
-    for (auto i{ 0 }; i < nr_workers; i++) {
-        workers.emplace_back(&ThreadPool::worker, this);
-    }
-}
-void ThreadPool::worker() {
-    for (;;) {
-        std::function<void()> cur_task;
-        {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [this]() {
-                return stop || !queue.empty();
-            });
-
-            if (stop && queue.empty()) 
-                break;
-            if (queue.empty())
-                continue; 
-
-            cur_task = queue.front();
-            queue.pop();
-            // grab the fx from queue
-        }
-        cur_task();
-    }
-} 
-template<typename F, typename... Args>
-inline auto ThreadPool::enqueue(F&& f, Args&&... args)
--> std::future<decltype(f(args...))> {
-    auto func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-    auto encapsulated_ptr =
-        std::make_shared<std::packaged_task<decltype(f(args...))()>>
-        (func);
-
-    std::future<std::result_of_t<F(Args...)>> future_object = encapsulated_ptr->get_future();
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        queue.emplace([encapsulated_ptr]() {
-            (*encapsulated_ptr)(); // execute the fx
-            });
-    }
-    cv.notify_one();
-    return future_object;
-}
-ThreadPool::~ThreadPool() {
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        stop = true;
-    }
-
-    cv.notify_all();
-    for (auto& worker : workers) {
-        worker.join();
-    }
-}
-
 
 struct Fixed {
     constexpr Fixed(int v): v(v << 16) {}
@@ -231,7 +152,11 @@ struct VectorField {
     }
 
     Fixed &get(int x, int y, int dx, int dy) {
-        size_t i = ranges::find(deltas, pair(dx, dy)) - deltas.begin();
+        size_t i;// = ranges::find(deltas, pair(dx, dy)) - deltas.begin();
+        if (deltas[0].first == dx && deltas[0].second == dy) i = 0;
+        else if (deltas[1].first == dx && deltas[1].second == dy) i = 1;
+        else if (deltas[2].first == dx && deltas[2].second == dy) i = 2;
+        else if (deltas[3].first == dx && deltas[3].second == dy) i = 3;
         assert(i < deltas.size());
         return v[x][y][i];
     }
@@ -257,16 +182,13 @@ tuple<Fixed, bool, pair<int, int>> propagate_flow(int x, int y, Fixed lim) {
             }
             // assert(v >= velocity_flow.get(x, y, dx, dy));
             auto vp = min(lim, cap - flow);
-                    auto st = std::chrono::steady_clock::now();
+            if (vp <= 0.0001) continue;
             if (last_use[nx][ny] == UT - 1) {
                 velocity_flow.add(x, y, dx, dy, vp);
                 last_use[x][y] = UT;
                 // cerr << x << " " << y << " -> " << nx << " " << ny << " " << vp << " / " << lim << "\n";
                 return {vp, 1, {nx, ny}};
             }
-                auto stop   = std::chrono::steady_clock::now();
-                auto cnt = std::chrono::duration_cast<std::chrono::milliseconds>(stop - st);
-                std::cout << "The time: " << cnt.count() << " ms\n"; //16086 ms without optimize
             auto [t, prop, end] = propagate_flow(nx, ny, vp);
             ret += t;
             if (prop) {
@@ -366,8 +288,11 @@ bool propagate_move(int x, int y, bool is_first) {
         }
 
         Fixed p = random01() * sum;
-        size_t d = std::ranges::upper_bound(tres, p) - tres.begin();
-
+        size_t d;
+        if (tres[0] > p) d = 0;
+        else if (tres[1] > p) d = 1;
+        else if (tres[2] > p) d = 2;
+        else if (tres[3] > p) d = 3;
         auto [dx, dy] = deltas[d];
         nx = x + dx;
         ny = y + dy;
@@ -393,10 +318,9 @@ bool propagate_move(int x, int y, bool is_first) {
     }
     return ret;
 }
-
 int dirs[N][M]{};
 int main() {
-    ThreadPool tr(4);
+    omp_set_num_threads(THREADS_NUM);
     rho[' '] = 0.01;
     rho['.'] = 1000;
     Fixed g = 0.1;
@@ -409,13 +333,12 @@ int main() {
             }
         }
     }
-    std::vector<std::future<void>> results;
+    auto start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < T; ++i) {
         
         Fixed total_delta_p = 0;
         // Apply external forces
         for (size_t x = 0; x < N; ++x) {
-            
             for (size_t y = 0; y < M; ++y) {
                 if (field[x][y] == '#' || field[x + 1][y] == '#') continue;
                     velocity.add(x, y, 1, 0, g);
@@ -492,19 +415,21 @@ int main() {
 
         UT += 2;
         prop = false;
+        #pragma omp parallel for collapse(2)
         for (size_t x = 0; x < N; ++x) {
             for (size_t y = 0; y < M; ++y) {
                 if (field[x][y] != '#' && last_use[x][y] != UT) {
+                    {
                     if (random01() < move_prob(x, y)) {
                         prop = true;
                         propagate_move(x, y, true);
                     } else {
                         propagate_stop(x, y, true);
                     }
+                    }
                 }
             }
         }
-
         if (prop) {
             cout << "Tick " << i << ":\n";
             for (size_t x = 0; x < N; ++x) {
@@ -512,4 +437,8 @@ int main() {
             }
         }
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time: " << elapsed.count() << " s\n";
+    return 0;
 }
